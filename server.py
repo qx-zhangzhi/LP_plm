@@ -123,6 +123,14 @@ class App(SimpleHTTPRequestHandler):
             with db() as conn:
                 members = [dict(row) for row in conn.execute("SELECT display_name,role_name FROM members WHERE active=1 ORDER BY id")]
             return self.respond(HTTPStatus.OK, members)
+        if path == "/api/change-requests":
+            with db() as conn:
+                changes = [dict(row) for row in conn.execute("SELECT * FROM change_requests ORDER BY created_at DESC")]
+            return self.respond(HTTPStatus.OK, changes)
+        if path == "/api/notifications":
+            with db() as conn:
+                notifications = [dict(row) for row in conn.execute("SELECT * FROM notifications WHERE recipient_name='张工' ORDER BY is_read,created_at DESC")]
+            return self.respond(HTTPStatus.OK, notifications)
         if path.startswith("/api/issues/") and path.endswith("/comments"):
             issue_id = path.split("/")[3]
             with db() as conn:
@@ -235,6 +243,19 @@ class App(SimpleHTTPRequestHandler):
                     conn.execute("""INSERT INTO reuse_requests (id,module_id,module_version,project_name,operating_conditions,status)
                         VALUES (:id,:module_id,:module_version,:project_name,:operating_conditions,:status)""", item)
                     return self.respond(HTTPStatus.CREATED, item)
+                if path == "/api/change-requests":
+                    required = ("module_id", "title", "reason", "impact_summary", "approver_name")
+                    if any(not str(data.get(key, "")).strip() for key in required):
+                        return self.respond(HTTPStatus.BAD_REQUEST, {"error": "请填写模块、变更原因、影响分析和审批人"})
+                    module = conn.execute("SELECT name FROM modules WHERE id=?", (data["module_id"],)).fetchone()
+                    if not module:
+                        return self.respond(HTTPStatus.NOT_FOUND, {"error": "未找到关联模块"})
+                    item = {"id": next_id(conn, "change_requests", "CR"), "module_name": module["name"], "initiator_name": "张工", "status": "待审批", "decision_note": "", **data}
+                    conn.execute("""INSERT INTO change_requests (id,module_id,module_name,title,reason,impact_summary,initiator_name,approver_name,status,decision_note)
+                        VALUES (:id,:module_id,:module_name,:title,:reason,:impact_summary,:initiator_name,:approver_name,:status,:decision_note)""", item)
+                    conn.execute("""INSERT INTO notifications (recipient_name,kind,message,target_type,target_id)
+                        VALUES (?,?,?,?,?)""", (item["approver_name"], "审批待办", f"{item['initiator_name']} 提交了变更 {item['id']}：{item['title']}", "change_request", item["id"]))
+                    return self.respond(HTTPStatus.CREATED, item)
             self.respond(HTTPStatus.NOT_FOUND, {"error": "接口不存在"})
         except ValueError as exc:
             self.respond(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
@@ -299,6 +320,20 @@ class App(SimpleHTTPRequestHandler):
                     if result.rowcount == 0:
                         return self.respond(HTTPStatus.NOT_FOUND, {"error": "未找到待关闭的问题"})
                 return self.respond(HTTPStatus.OK, {"id": issue_id, "status": "已关闭"})
+            if path.startswith("/api/change-requests/") and path.endswith("/decision"):
+                change_id = path.split("/")[3]
+                status = data.get("status")
+                if status not in ("已批准", "已驳回"):
+                    return self.respond(HTTPStatus.BAD_REQUEST, {"error": "审批结果必须为已批准或已驳回"})
+                with db() as conn:
+                    current = conn.execute("SELECT * FROM change_requests WHERE id=?", (change_id,)).fetchone()
+                    if not current or current["status"] != "待审批":
+                        return self.respond(HTTPStatus.CONFLICT, {"error": "该变更不存在或已完成审批"})
+                    note = str(data.get("decision_note") or "")
+                    conn.execute("UPDATE change_requests SET status=?,decision_note=?,decided_at=CURRENT_TIMESTAMP WHERE id=?", (status, note, change_id))
+                    conn.execute("""INSERT INTO notifications (recipient_name,kind,message,target_type,target_id)
+                        VALUES (?,?,?,?,?)""", (current["initiator_name"], "审批结果", f"变更 {change_id} 已{status}：{note or '无补充说明'}", "change_request", change_id))
+                return self.respond(HTTPStatus.OK, {"id": change_id, "status": status, "decision_note": note})
             self.respond(HTTPStatus.NOT_FOUND, {"error": "接口不存在"})
         except ValueError as exc:
             self.respond(HTTPStatus.BAD_REQUEST, {"error": str(exc)})

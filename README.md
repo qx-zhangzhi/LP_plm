@@ -21,6 +21,7 @@
 - 草稿编辑、验证记录与交付物发布门禁
 - 图纸与附件上传、模块内下载
 - 成员目录、问题指派与评审讨论串
+- 模块变更审批与站内通知
 
 ## API（当前）
 
@@ -34,6 +35,9 @@
 - `PATCH /api/issues/{id}/close`
 - `GET /api/members`
 - `GET/POST /api/issues/{id}/comments`
+- `GET/POST /api/change-requests`
+- `PATCH /api/change-requests/{id}/decision`
+- `GET /api/notifications`
 - `GET/POST /api/reuse-requests`
 - `GET /api/health`
 
