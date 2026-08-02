@@ -22,6 +22,7 @@
 - 图纸与附件上传、模块内下载
 - 成员目录、问题指派与评审讨论串
 - 模块变更审批与站内通知
+- 本地登录与服务端角色权限
 
 ## API（当前）
 
@@ -38,9 +39,14 @@
 - `GET/POST /api/change-requests`
 - `PATCH /api/change-requests/{id}/decision`
 - `GET /api/notifications`
+- `POST /api/auth/login`、`POST /api/auth/logout`、`GET /api/auth/me`
 - `GET/POST /api/reuse-requests`
 - `GET /api/health`
 
 发布会要求模块先关联 GitLab 项目、填写验证记录，并登记 CAD 源文件、PDF、STEP、DXF、BOM 与装配说明。当前 MVP 已有后端 API，但尚未接入身份认证、GitLab / Git LFS、真实发布包和 SolidWorks 插件；这些是下一阶段的优先事项。
 
 上传文件保存在本机 `uploads/` 目录，单个文件上限为 100 MB；该目录与 SQLite 数据库都属于运行数据，应备份但不应提交到 Git。
+
+## 试点账号
+
+所有试点账号的初始密码都是 `modu-demo`：`zhang`（设计师）、`li` / `wang`（评审人）、`chen`（项目负责人）、`admin`（管理员）。正式部署前必须更换为企业身份认证或 GitLab OAuth，且不能继续使用默认密码。

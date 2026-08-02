@@ -9,6 +9,8 @@ import json
 import sqlite3
 import cgi
 import re
+import hashlib
+import secrets
 from datetime import datetime, timezone
 from http import HTTPStatus
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
@@ -29,7 +31,9 @@ SEED_ISSUES = [
     {"id": "Q-027", "title": "皮带松弛", "module": "皮带直线运动模组", "source": "装配现场", "detail": "运行后预紧力不足", "status": "待处理"},
     {"id": "R-014", "title": "张紧器与侧板间隙不足", "module": "皮带直线运动模组", "source": "设计评审", "detail": "需调整侧板开孔并补充装配公差", "status": "待处理"},
 ]
-SEED_MEMBERS = [("张工", "机械设计"), ("李工", "制造工程"), ("王工", "质量工程"), ("陈工", "项目负责人")]
+SEED_MEMBERS = [("张工", "机械设计", "zhang", "designer"), ("李工", "制造工程", "li", "reviewer"), ("王工", "质量工程", "wang", "reviewer"), ("陈工", "项目负责人", "chen", "project_lead"), ("管理员", "系统管理员", "admin", "admin")]
+SEED_PASSWORD = "modu-demo"
+SESSIONS = {}
 
 def db():
     conn = sqlite3.connect(DB_PATH)
@@ -69,7 +73,25 @@ def initialize():
             conn.executemany("""INSERT INTO issues (id,title,module_id,module_name,source,detail,status)
                 VALUES (:id,:title,:module_id,:module,:source,:detail,:status)""", [{**issue, "module_id": module_ids.get(issue["module"])} for issue in SEED_ISSUES])
         if conn.execute("SELECT COUNT(*) FROM members").fetchone()[0] == 0:
-            conn.executemany("INSERT INTO members (display_name,role_name) VALUES (?,?)", SEED_MEMBERS)
+            conn.executemany("INSERT INTO members (display_name,role_name) VALUES (?,?)", [(name, role) for name, role, _, _ in SEED_MEMBERS])
+        member_columns = {row[1] for row in conn.execute("PRAGMA table_info(members)")}
+        for column, statement in {
+            "login_name": "ALTER TABLE members ADD COLUMN login_name TEXT NOT NULL DEFAULT ''",
+            "password_salt": "ALTER TABLE members ADD COLUMN password_salt TEXT NOT NULL DEFAULT ''",
+            "password_hash": "ALTER TABLE members ADD COLUMN password_hash TEXT NOT NULL DEFAULT ''",
+            "role_code": "ALTER TABLE members ADD COLUMN role_code TEXT NOT NULL DEFAULT 'designer'",
+        }.items():
+            if column not in member_columns:
+                conn.execute(statement)
+        for display_name, _, login_name, role_code in SEED_MEMBERS:
+            member = conn.execute("SELECT password_salt,password_hash FROM members WHERE display_name=?", (display_name,)).fetchone()
+            if not member:
+                conn.execute("INSERT INTO members (display_name,role_name) VALUES (?,?)", (display_name, next(role for name, role, _, _ in SEED_MEMBERS if name == display_name)))
+                member = conn.execute("SELECT password_salt,password_hash FROM members WHERE display_name=?", (display_name,)).fetchone()
+            if member and not member["password_hash"]:
+                salt = secrets.token_hex(16)
+                password_hash = hash_password(SEED_PASSWORD, salt)
+                conn.execute("UPDATE members SET login_name=?,password_salt=?,password_hash=?,role_code=? WHERE display_name=?", (login_name, salt, password_hash, role_code, display_name))
     UPLOADS.mkdir(exist_ok=True)
 
 def module_view(row):
@@ -81,6 +103,9 @@ def module_view(row):
     result["deliverables"] = json.loads(result.pop("deliverables_json") or "[]")
     return result
 
+def hash_password(password, salt):
+    return hashlib.pbkdf2_hmac("sha256", password.encode(), salt.encode(), 120_000).hex()
+
 def next_id(conn, table, prefix):
     rows = conn.execute(f"SELECT id FROM {table} WHERE id GLOB ?", (prefix + "-*",)).fetchall()
     high = max((int(row[0].split("-")[1]) for row in rows if row[0].split("-")[1].isdigit()), default=0)
@@ -91,11 +116,13 @@ class App(SimpleHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         super().end_headers()
 
-    def respond(self, status, data):
+    def respond(self, status, data, headers=None):
         payload = json.dumps(data, ensure_ascii=False).encode()
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(payload)))
+        for name, value in (headers or {}).items():
+            self.send_header(name, value)
         self.end_headers()
         self.wfile.write(payload)
 
@@ -106,10 +133,30 @@ class App(SimpleHTTPRequestHandler):
         except (json.JSONDecodeError, UnicodeDecodeError):
             raise ValueError("请求体必须是 JSON")
 
+    def user(self):
+        cookies = self.headers.get("Cookie", "")
+        token = next((part.split("=", 1)[1] for part in cookies.split("; ") if part.startswith("modu_session=")), "")
+        return SESSIONS.get(token)
+
+    def require(self, *roles):
+        user = self.user()
+        if not user:
+            self.respond(HTTPStatus.UNAUTHORIZED, {"error": "请先登录"})
+            return None
+        if roles and user["role_code"] not in roles:
+            self.respond(HTTPStatus.FORBIDDEN, {"error": "当前角色没有此操作权限"})
+            return None
+        return user
+
     def do_GET(self):
         path = urlparse(self.path).path
         if path == "/api/health":
             return self.respond(HTTPStatus.OK, {"ok": True, "time": datetime.now(timezone.utc).isoformat()})
+        if path == "/api/auth/me":
+            user = self.user()
+            return self.respond(HTTPStatus.OK, user) if user else self.respond(HTTPStatus.UNAUTHORIZED, {"error": "请先登录"})
+        if path.startswith("/api/") and not self.require():
+            return
         if path == "/api/modules":
             with db() as conn:
                 modules = [module_view(row) for row in conn.execute("SELECT * FROM modules ORDER BY created_at DESC")]
@@ -121,7 +168,7 @@ class App(SimpleHTTPRequestHandler):
             return self.respond(HTTPStatus.OK, issues)
         if path == "/api/members":
             with db() as conn:
-                members = [dict(row) for row in conn.execute("SELECT display_name,role_name FROM members WHERE active=1 ORDER BY id")]
+                members = [dict(row) for row in conn.execute("SELECT display_name,role_name,role_code FROM members WHERE active=1 ORDER BY id")]
             return self.respond(HTTPStatus.OK, members)
         if path == "/api/change-requests":
             with db() as conn:
@@ -129,7 +176,7 @@ class App(SimpleHTTPRequestHandler):
             return self.respond(HTTPStatus.OK, changes)
         if path == "/api/notifications":
             with db() as conn:
-                notifications = [dict(row) for row in conn.execute("SELECT * FROM notifications WHERE recipient_name='张工' ORDER BY is_read,created_at DESC")]
+                notifications = [dict(row) for row in conn.execute("SELECT * FROM notifications WHERE recipient_name=? ORDER BY is_read,created_at DESC", (self.user()["display_name"],))]
             return self.respond(HTTPStatus.OK, notifications)
         if path.startswith("/api/issues/") and path.endswith("/comments"):
             issue_id = path.split("/")[3]
@@ -174,11 +221,31 @@ class App(SimpleHTTPRequestHandler):
     def do_POST(self):
         path = urlparse(self.path).path
         try:
+            if path == "/api/auth/login":
+                data = self.body()
+                with db() as conn:
+                    member = conn.execute("SELECT display_name,role_name,login_name,password_salt,password_hash,role_code FROM members WHERE login_name=? AND active=1", (data.get("login_name", ""),)).fetchone()
+                if not member or not secrets.compare_digest(member["password_hash"], hash_password(str(data.get("password", "")), member["password_salt"])):
+                    return self.respond(HTTPStatus.UNAUTHORIZED, {"error": "账号或密码错误"})
+                token = secrets.token_urlsafe(32)
+                user = {"display_name": member["display_name"], "role_name": member["role_name"], "role_code": member["role_code"]}
+                SESSIONS[token] = user
+                return self.respond(HTTPStatus.OK, user, {"Set-Cookie": f"modu_session={token}; HttpOnly; SameSite=Lax; Path=/"})
+            if path == "/api/auth/logout":
+                user = self.user()
+                if user:
+                    token = next((part.split("=", 1)[1] for part in self.headers.get("Cookie", "").split("; ") if part.startswith("modu_session=")), "")
+                    SESSIONS.pop(token, None)
+                return self.respond(HTTPStatus.OK, {"ok": True}, {"Set-Cookie": "modu_session=; Max-Age=0; Path=/"})
+            if not self.require():
+                return
             if path.startswith("/api/modules/") and path.endswith("/files"):
                 return self.upload_file(path.split("/")[3])
             data = self.body()
             with db() as conn:
                 if path.startswith("/api/modules/") and path.endswith("/publish"):
+                    if not self.require("designer", "admin"):
+                        return
                     module_id = path.split("/")[3]
                     module = conn.execute("SELECT * FROM modules WHERE id = ?", (module_id,)).fetchone()
                     if not module:
@@ -211,6 +278,8 @@ class App(SimpleHTTPRequestHandler):
                     item = module_view(conn.execute("SELECT * FROM modules WHERE id = ?", (module_id,)).fetchone())
                     return self.respond(HTTPStatus.CREATED, {"module": item, "release_tag": release_tag, "sync_status": "待同步", "manifest": manifest})
                 if path == "/api/modules":
+                    if not self.require("designer", "admin"):
+                        return
                     required = ("name", "version", "purpose", "scope", "avoid", "interface")
                     if any(not str(data.get(key, "")).strip() for key in required):
                         return self.respond(HTTPStatus.BAD_REQUEST, {"error": "请填写模块的用途、接口与应用边界"})
@@ -223,7 +292,7 @@ class App(SimpleHTTPRequestHandler):
                     if any(not str(data.get(key, "")).strip() for key in ("title", "module", "source")):
                         return self.respond(HTTPStatus.BAD_REQUEST, {"error": "请填写问题标题、来源和关联模块"})
                     module_row = conn.execute("SELECT id FROM modules WHERE name = ?", (data["module"],)).fetchone()
-                    item = {"id": next_id(conn, "issues", "Q"), "status": "待处理", "detail": "", "assigned_to": "未分配", "created_by": "张工", **data}
+                    item = {"id": next_id(conn, "issues", "Q"), "status": "待处理", "detail": "", "assigned_to": "未分配", "created_by": self.user()["display_name"], **data}
                     conn.execute("""INSERT INTO issues (id,title,module_id,module_name,source,detail,status,assigned_to,created_by)
                         VALUES (:id,:title,:module_id,:module,:source,:detail,:status,:assigned_to,:created_by)""", {**item, "module_id": module_row["id"] if module_row else None})
                     return self.respond(HTTPStatus.CREATED, item)
@@ -233,7 +302,7 @@ class App(SimpleHTTPRequestHandler):
                         return self.respond(HTTPStatus.BAD_REQUEST, {"error": "请填写讨论内容"})
                     if not conn.execute("SELECT 1 FROM issues WHERE id=?", (issue_id,)).fetchone():
                         return self.respond(HTTPStatus.NOT_FOUND, {"error": "未找到问题"})
-                    author = str(data.get("author_name") or "张工")
+                    author = self.user()["display_name"]
                     result = conn.execute("INSERT INTO issue_comments (issue_id,author_name,body) VALUES (?,?,?)", (issue_id, author, data["body"].strip()))
                     return self.respond(HTTPStatus.CREATED, {"id": result.lastrowid, "author_name": author, "body": data["body"].strip()})
                 if path == "/api/reuse-requests":
@@ -250,7 +319,7 @@ class App(SimpleHTTPRequestHandler):
                     module = conn.execute("SELECT name FROM modules WHERE id=?", (data["module_id"],)).fetchone()
                     if not module:
                         return self.respond(HTTPStatus.NOT_FOUND, {"error": "未找到关联模块"})
-                    item = {"id": next_id(conn, "change_requests", "CR"), "module_name": module["name"], "initiator_name": "张工", "status": "待审批", "decision_note": "", **data}
+                    item = {"id": next_id(conn, "change_requests", "CR"), "module_name": module["name"], "initiator_name": self.user()["display_name"], "status": "待审批", "decision_note": "", **data}
                     conn.execute("""INSERT INTO change_requests (id,module_id,module_name,title,reason,impact_summary,initiator_name,approver_name,status,decision_note)
                         VALUES (:id,:module_id,:module_name,:title,:reason,:impact_summary,:initiator_name,:approver_name,:status,:decision_note)""", item)
                     conn.execute("""INSERT INTO notifications (recipient_name,kind,message,target_type,target_id)
@@ -290,8 +359,12 @@ class App(SimpleHTTPRequestHandler):
     def do_PATCH(self):
         path = urlparse(self.path).path
         try:
+            if not self.require():
+                return
             data = self.body()
             if path.startswith("/api/modules/") and not path.endswith("/publish"):
+                if not self.require("designer", "admin"):
+                    return
                 module_id = path.split("/")[3]
                 with db() as conn:
                     current = conn.execute("SELECT * FROM modules WHERE id=?", (module_id,)).fetchone()
@@ -321,6 +394,8 @@ class App(SimpleHTTPRequestHandler):
                         return self.respond(HTTPStatus.NOT_FOUND, {"error": "未找到待关闭的问题"})
                 return self.respond(HTTPStatus.OK, {"id": issue_id, "status": "已关闭"})
             if path.startswith("/api/change-requests/") and path.endswith("/decision"):
+                if not self.require("project_lead", "admin"):
+                    return
                 change_id = path.split("/")[3]
                 status = data.get("status")
                 if status not in ("已批准", "已驳回"):

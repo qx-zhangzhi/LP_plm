@@ -42,7 +42,11 @@ CREATE TABLE IF NOT EXISTS members (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   display_name TEXT NOT NULL UNIQUE,
   role_name TEXT NOT NULL,
-  active INTEGER NOT NULL DEFAULT 1
+  active INTEGER NOT NULL DEFAULT 1,
+  login_name TEXT NOT NULL DEFAULT '',
+  password_salt TEXT NOT NULL DEFAULT '',
+  password_hash TEXT NOT NULL DEFAULT '',
+  role_code TEXT NOT NULL DEFAULT 'designer'
 );
 
 CREATE TABLE IF NOT EXISTS issue_comments (
