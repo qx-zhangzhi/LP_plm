@@ -1,3 +1,20 @@
+# Modu runtime state
 modu.db
 __pycache__/
 *.py[cod]
+
+# Python environments and build artifacts
+.venv/
+venv/
+env/
+build/
+dist/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local credentials and editor settings
+.env
+.envrc
+.vscode/
