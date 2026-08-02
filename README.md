@@ -24,9 +24,11 @@
 ## API（当前）
 
 - `GET/POST /api/modules`
+- `POST /api/modules/{id}/publish` — 生成发布清单、冻结版本并等待 GitLab Release 同步
+- `GET /api/modules/{id}/release`
 - `GET/POST /api/issues`
 - `PATCH /api/issues/{id}/close`
 - `GET/POST /api/reuse-requests`
 - `GET /api/health`
 
-当前 MVP 已有后端 API，但尚未接入身份认证、GitLab / Git LFS、发布包和 SolidWorks 插件；这些是下一阶段的优先事项。
+发布会要求模块先关联 GitLab 项目，并生成包含 CAD 源文件、PDF、STEP、DXF、BOM 与装配说明的发布清单。当前 MVP 已有后端 API，但尚未接入身份认证、GitLab / Git LFS、发布包和 SolidWorks 插件；这些是下一阶段的优先事项。

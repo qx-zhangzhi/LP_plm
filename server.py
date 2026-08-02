@@ -45,6 +45,7 @@ def initialize():
         for column, statement in migrations.items():
             if column not in columns:
                 conn.execute(statement)
+        conn.executescript((ROOT / "migrations" / "002_release_freeze.sql").read_text())
         if conn.execute("SELECT COUNT(*) FROM modules").fetchone()[0] == 0:
             conn.executemany("""INSERT INTO modules
                 (id,name,version,status,icon,purpose,tags,scope,avoid,interface_spec,dependencies,verification,usage_count)
@@ -103,6 +104,15 @@ class App(SimpleHTTPRequestHandler):
             with db() as conn:
                 requests = [dict(row) for row in conn.execute("SELECT * FROM reuse_requests ORDER BY created_at DESC")]
             return self.respond(HTTPStatus.OK, requests)
+        if path.startswith("/api/modules/") and path.endswith("/release"):
+            module_id = path.split("/")[3]
+            with db() as conn:
+                release = conn.execute("SELECT * FROM module_releases WHERE module_id = ? ORDER BY created_at DESC LIMIT 1", (module_id,)).fetchone()
+            if not release:
+                return self.respond(HTTPStatus.NOT_FOUND, {"error": "该模块尚未发布"})
+            item = dict(release)
+            item["manifest"] = json.loads(item.pop("manifest_json"))
+            return self.respond(HTTPStatus.OK, item)
         return super().do_GET()
 
     def do_POST(self):
@@ -110,6 +120,30 @@ class App(SimpleHTTPRequestHandler):
         try:
             data = self.body()
             with db() as conn:
+                if path.startswith("/api/modules/") and path.endswith("/publish"):
+                    module_id = path.split("/")[3]
+                    module = conn.execute("SELECT * FROM modules WHERE id = ?", (module_id,)).fetchone()
+                    if not module:
+                        return self.respond(HTTPStatus.NOT_FOUND, {"error": "未找到模块"})
+                    if module["status"] != "草稿":
+                        return self.respond(HTTPStatus.CONFLICT, {"error": "仅草稿模块可以发布；已发布版本不可覆盖"})
+                    if not module["gitlab_project"].strip():
+                        return self.respond(HTTPStatus.BAD_REQUEST, {"error": "发布前必须关联 GitLab 项目"})
+                    release_tag = f"modu/{module_id}/v{module['version']}"
+                    manifest = {
+                        "module": {"id": module_id, "name": module["name"], "version": module["version"]},
+                        "required_artifacts": ["SolidWorks 源文件", "PDF", "STEP", "DXF", "BOM", "装配说明"],
+                        "verification": module["verification"],
+                        "interface": module["interface_spec"],
+                        "scope": module["scope"],
+                    }
+                    ref = module["gitlab_ref"].strip() or "main"
+                    conn.execute("""INSERT INTO module_releases (module_id,module_version,release_tag,gitlab_project,gitlab_ref,manifest_json)
+                        VALUES (?,?,?,?,?,?)""", (module_id, module["version"], release_tag, module["gitlab_project"], ref, json.dumps(manifest, ensure_ascii=False)))
+                    conn.execute("""UPDATE modules SET status='已发布', release_tag=?, gitlab_ref=?, frozen_at=CURRENT_TIMESTAMP,
+                        updated_at=CURRENT_TIMESTAMP WHERE id=?""", (release_tag, ref, module_id))
+                    item = module_view(conn.execute("SELECT * FROM modules WHERE id = ?", (module_id,)).fetchone())
+                    return self.respond(HTTPStatus.CREATED, {"module": item, "release_tag": release_tag, "sync_status": "待同步", "manifest": manifest})
                 if path == "/api/modules":
                     required = ("name", "version", "purpose", "scope", "avoid", "interface")
                     if any(not str(data.get(key, "")).strip() for key in required):
