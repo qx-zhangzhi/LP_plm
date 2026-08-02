@@ -18,6 +18,7 @@ CREATE TABLE IF NOT EXISTS modules (
   gitlab_ref TEXT NOT NULL DEFAULT '',
   release_tag TEXT NOT NULL DEFAULT '',
   frozen_at TEXT,
+  deliverables_json TEXT NOT NULL DEFAULT '[]',
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );

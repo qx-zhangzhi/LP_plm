@@ -41,6 +41,7 @@ def initialize():
             "gitlab_ref": "ALTER TABLE modules ADD COLUMN gitlab_ref TEXT NOT NULL DEFAULT ''",
             "release_tag": "ALTER TABLE modules ADD COLUMN release_tag TEXT NOT NULL DEFAULT ''",
             "frozen_at": "ALTER TABLE modules ADD COLUMN frozen_at TEXT",
+            "deliverables_json": "ALTER TABLE modules ADD COLUMN deliverables_json TEXT NOT NULL DEFAULT '[]'",
         }
         for column, statement in migrations.items():
             if column not in columns:
@@ -61,6 +62,7 @@ def module_view(row):
     result["deps"] = result.pop("dependencies")
     result["verify"] = result.pop("verification")
     result["uses"] = result.pop("usage_count")
+    result["deliverables"] = json.loads(result.pop("deliverables_json") or "[]")
     return result
 
 def next_id(conn, table, prefix):
@@ -130,9 +132,17 @@ class App(SimpleHTTPRequestHandler):
                     if not module["gitlab_project"].strip():
                         return self.respond(HTTPStatus.BAD_REQUEST, {"error": "发布前必须关联 GitLab 项目"})
                     release_tag = f"modu/{module_id}/v{module['version']}"
+                    required_artifacts = ["SolidWorks 源文件", "PDF", "STEP", "DXF", "BOM", "装配说明"]
+                    deliverables = json.loads(module["deliverables_json"] or "[]")
+                    missing = [artifact for artifact in required_artifacts if artifact not in deliverables]
+                    if module["verification"] == "尚未开始验证":
+                        return self.respond(HTTPStatus.BAD_REQUEST, {"error": "发布前必须填写验证记录"})
+                    if missing:
+                        return self.respond(HTTPStatus.BAD_REQUEST, {"error": "发布包缺少：" + "、".join(missing)})
                     manifest = {
                         "module": {"id": module_id, "name": module["name"], "version": module["version"]},
-                        "required_artifacts": ["SolidWorks 源文件", "PDF", "STEP", "DXF", "BOM", "装配说明"],
+                        "required_artifacts": required_artifacts,
+                        "deliverables": deliverables,
                         "verification": module["verification"],
                         "interface": module["interface_spec"],
                         "scope": module["scope"],
@@ -149,9 +159,9 @@ class App(SimpleHTTPRequestHandler):
                     if any(not str(data.get(key, "")).strip() for key in required):
                         return self.respond(HTTPStatus.BAD_REQUEST, {"error": "请填写模块的用途、接口与应用边界"})
                     item = {"id": next_id(conn, "modules", "M"), "status": "草稿", "icon": "◫", "tags": data["scope"], "verify": "尚未开始验证", "uses": 0, **data}
-                    item = {"gitlab_project": "", "gitlab_ref": "", "release_tag": "", "frozen_at": None, **item}
-                    conn.execute("""INSERT INTO modules (id,name,version,status,icon,purpose,tags,scope,avoid,interface_spec,dependencies,verification,usage_count,gitlab_project,gitlab_ref,release_tag,frozen_at)
-                        VALUES (:id,:name,:version,:status,:icon,:purpose,:tags,:scope,:avoid,:interface,:deps,:verify,:uses,:gitlab_project,:gitlab_ref,:release_tag,:frozen_at)""", item)
+                    item = {"gitlab_project": "", "gitlab_ref": "", "release_tag": "", "frozen_at": None, "deliverables_json": "[]", **item}
+                    conn.execute("""INSERT INTO modules (id,name,version,status,icon,purpose,tags,scope,avoid,interface_spec,dependencies,verification,usage_count,gitlab_project,gitlab_ref,release_tag,frozen_at,deliverables_json)
+                        VALUES (:id,:name,:version,:status,:icon,:purpose,:tags,:scope,:avoid,:interface,:deps,:verify,:uses,:gitlab_project,:gitlab_ref,:release_tag,:frozen_at,:deliverables_json)""", item)
                     return self.respond(HTTPStatus.CREATED, item)
                 if path == "/api/issues":
                     if any(not str(data.get(key, "")).strip() for key in ("title", "module", "source")):
@@ -176,14 +186,42 @@ class App(SimpleHTTPRequestHandler):
 
     def do_PATCH(self):
         path = urlparse(self.path).path
-        if not path.startswith("/api/issues/") or not path.endswith("/close"):
-            return self.respond(HTTPStatus.NOT_FOUND, {"error": "接口不存在"})
-        issue_id = path.split("/")[3]
-        with db() as conn:
-            result = conn.execute("UPDATE issues SET status='已关闭', closed_at=CURRENT_TIMESTAMP WHERE id=? AND status!='已关闭'", (issue_id,))
-            if result.rowcount == 0:
-                return self.respond(HTTPStatus.NOT_FOUND, {"error": "未找到待关闭的问题"})
-        self.respond(HTTPStatus.OK, {"id": issue_id, "status": "已关闭"})
+        try:
+            data = self.body()
+            if path.startswith("/api/modules/") and not path.endswith("/publish"):
+                module_id = path.split("/")[3]
+                with db() as conn:
+                    current = conn.execute("SELECT * FROM modules WHERE id=?", (module_id,)).fetchone()
+                    if not current:
+                        return self.respond(HTTPStatus.NOT_FOUND, {"error": "未找到模块"})
+                    if current["status"] != "草稿":
+                        return self.respond(HTTPStatus.CONFLICT, {"error": "已发布模块不可直接编辑；请创建新的 Revision"})
+                    allowed = {"purpose", "scope", "avoid", "interface", "deps", "verify", "gitlab_project", "gitlab_ref", "deliverables"}
+                    changes = {key: value for key, value in data.items() if key in allowed}
+                    if not changes:
+                        return self.respond(HTTPStatus.BAD_REQUEST, {"error": "没有可保存的变更"})
+                    mapping = {"interface": "interface_spec", "deps": "dependencies", "verify": "verification"}
+                    assignments, values = [], []
+                    for key, value in changes.items():
+                        column = mapping.get(key, key)
+                        if key == "deliverables":
+                            column, value = "deliverables_json", json.dumps(value, ensure_ascii=False)
+                        assignments.append(f"{column}=?")
+                        values.append(value)
+                    conn.execute(f"UPDATE modules SET {', '.join(assignments)}, updated_at=CURRENT_TIMESTAMP WHERE id=?", (*values, module_id))
+                    return self.respond(HTTPStatus.OK, module_view(conn.execute("SELECT * FROM modules WHERE id=?", (module_id,)).fetchone()))
+            if path.startswith("/api/issues/") and path.endswith("/close"):
+                issue_id = path.split("/")[3]
+                with db() as conn:
+                    result = conn.execute("UPDATE issues SET status='已关闭', closed_at=CURRENT_TIMESTAMP WHERE id=? AND status!='已关闭'", (issue_id,))
+                    if result.rowcount == 0:
+                        return self.respond(HTTPStatus.NOT_FOUND, {"error": "未找到待关闭的问题"})
+                return self.respond(HTTPStatus.OK, {"id": issue_id, "status": "已关闭"})
+            self.respond(HTTPStatus.NOT_FOUND, {"error": "接口不存在"})
+        except ValueError as exc:
+            self.respond(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+        except sqlite3.Error as exc:
+            self.respond(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": f"数据库错误：{exc}"})
 
 def main():
     initialize()
