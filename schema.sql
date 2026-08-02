@@ -31,9 +31,27 @@ CREATE TABLE IF NOT EXISTS issues (
   source TEXT NOT NULL,
   detail TEXT NOT NULL DEFAULT '',
   status TEXT NOT NULL CHECK (status IN ('待处理', '已关闭')) DEFAULT '待处理',
+  assigned_to TEXT NOT NULL DEFAULT '未分配',
+  created_by TEXT NOT NULL DEFAULT '当前用户',
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   closed_at TEXT,
   FOREIGN KEY(module_id) REFERENCES modules(id)
+);
+
+CREATE TABLE IF NOT EXISTS members (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  display_name TEXT NOT NULL UNIQUE,
+  role_name TEXT NOT NULL,
+  active INTEGER NOT NULL DEFAULT 1
+);
+
+CREATE TABLE IF NOT EXISTS issue_comments (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  issue_id TEXT NOT NULL,
+  author_name TEXT NOT NULL,
+  body TEXT NOT NULL,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY(issue_id) REFERENCES issues(id)
 );
 
 CREATE TABLE IF NOT EXISTS reuse_requests (
@@ -74,6 +92,7 @@ CREATE TABLE IF NOT EXISTS module_files (
 
 CREATE INDEX IF NOT EXISTS modules_status_idx ON modules(status);
 CREATE INDEX IF NOT EXISTS issues_status_idx ON issues(status);
+CREATE INDEX IF NOT EXISTS issue_comments_issue_idx ON issue_comments(issue_id);
 CREATE INDEX IF NOT EXISTS reuse_requests_module_idx ON reuse_requests(module_id);
 CREATE INDEX IF NOT EXISTS module_releases_module_idx ON module_releases(module_id);
 CREATE INDEX IF NOT EXISTS module_files_module_idx ON module_files(module_id);

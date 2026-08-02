@@ -1,0 +1,20 @@
+ALTER TABLE issues ADD COLUMN assigned_to TEXT NOT NULL DEFAULT '未分配';
+ALTER TABLE issues ADD COLUMN created_by TEXT NOT NULL DEFAULT '当前用户';
+
+CREATE TABLE IF NOT EXISTS members (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  display_name TEXT NOT NULL UNIQUE,
+  role_name TEXT NOT NULL,
+  active INTEGER NOT NULL DEFAULT 1
+);
+
+CREATE TABLE IF NOT EXISTS issue_comments (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  issue_id TEXT NOT NULL,
+  author_name TEXT NOT NULL,
+  body TEXT NOT NULL,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY(issue_id) REFERENCES issues(id)
+);
+
+CREATE INDEX IF NOT EXISTS issue_comments_issue_idx ON issue_comments(issue_id);

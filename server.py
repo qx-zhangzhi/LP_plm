@@ -29,6 +29,7 @@ SEED_ISSUES = [
     {"id": "Q-027", "title": "皮带松弛", "module": "皮带直线运动模组", "source": "装配现场", "detail": "运行后预紧力不足", "status": "待处理"},
     {"id": "R-014", "title": "张紧器与侧板间隙不足", "module": "皮带直线运动模组", "source": "设计评审", "detail": "需调整侧板开孔并补充装配公差", "status": "待处理"},
 ]
+SEED_MEMBERS = [("张工", "机械设计"), ("李工", "制造工程"), ("王工", "质量工程"), ("陈工", "项目负责人")]
 
 def db():
     conn = sqlite3.connect(DB_PATH)
@@ -52,6 +53,13 @@ def initialize():
                 conn.execute(statement)
         conn.executescript((ROOT / "migrations" / "002_release_freeze.sql").read_text())
         conn.executescript((ROOT / "migrations" / "004_module_files.sql").read_text())
+        issue_columns = {row[1] for row in conn.execute("PRAGMA table_info(issues)")}
+        for column, statement in {
+            "assigned_to": "ALTER TABLE issues ADD COLUMN assigned_to TEXT NOT NULL DEFAULT '未分配'",
+            "created_by": "ALTER TABLE issues ADD COLUMN created_by TEXT NOT NULL DEFAULT '当前用户'",
+        }.items():
+            if column not in issue_columns:
+                conn.execute(statement)
         if conn.execute("SELECT COUNT(*) FROM modules").fetchone()[0] == 0:
             conn.executemany("""INSERT INTO modules
                 (id,name,version,status,icon,purpose,tags,scope,avoid,interface_spec,dependencies,verification,usage_count)
@@ -60,6 +68,8 @@ def initialize():
             module_ids = {row["name"]: row["id"] for row in conn.execute("SELECT id,name FROM modules")}
             conn.executemany("""INSERT INTO issues (id,title,module_id,module_name,source,detail,status)
                 VALUES (:id,:title,:module_id,:module,:source,:detail,:status)""", [{**issue, "module_id": module_ids.get(issue["module"])} for issue in SEED_ISSUES])
+        if conn.execute("SELECT COUNT(*) FROM members").fetchone()[0] == 0:
+            conn.executemany("INSERT INTO members (display_name,role_name) VALUES (?,?)", SEED_MEMBERS)
     UPLOADS.mkdir(exist_ok=True)
 
 def module_view(row):
@@ -106,8 +116,18 @@ class App(SimpleHTTPRequestHandler):
             return self.respond(HTTPStatus.OK, modules)
         if path == "/api/issues":
             with db() as conn:
-                issues = [dict(row) for row in conn.execute("SELECT id,title,module_name AS module,source,detail,status,created_at,closed_at FROM issues ORDER BY created_at DESC")]
+                issues = [dict(row) for row in conn.execute("""SELECT i.id,i.title,i.module_name AS module,i.source,i.detail,i.status,i.assigned_to,i.created_by,i.created_at,i.closed_at,
+                    (SELECT COUNT(*) FROM issue_comments c WHERE c.issue_id=i.id) AS comment_count FROM issues i ORDER BY i.created_at DESC""")]
             return self.respond(HTTPStatus.OK, issues)
+        if path == "/api/members":
+            with db() as conn:
+                members = [dict(row) for row in conn.execute("SELECT display_name,role_name FROM members WHERE active=1 ORDER BY id")]
+            return self.respond(HTTPStatus.OK, members)
+        if path.startswith("/api/issues/") and path.endswith("/comments"):
+            issue_id = path.split("/")[3]
+            with db() as conn:
+                comments = [dict(row) for row in conn.execute("SELECT id,author_name,body,created_at FROM issue_comments WHERE issue_id=? ORDER BY created_at", (issue_id,))]
+            return self.respond(HTTPStatus.OK, comments)
         if path == "/api/reuse-requests":
             with db() as conn:
                 requests = [dict(row) for row in conn.execute("SELECT * FROM reuse_requests ORDER BY created_at DESC")]
@@ -195,10 +215,19 @@ class App(SimpleHTTPRequestHandler):
                     if any(not str(data.get(key, "")).strip() for key in ("title", "module", "source")):
                         return self.respond(HTTPStatus.BAD_REQUEST, {"error": "请填写问题标题、来源和关联模块"})
                     module_row = conn.execute("SELECT id FROM modules WHERE name = ?", (data["module"],)).fetchone()
-                    item = {"id": next_id(conn, "issues", "Q"), "status": "待处理", "detail": "", **data}
-                    conn.execute("""INSERT INTO issues (id,title,module_id,module_name,source,detail,status)
-                        VALUES (:id,:title,:module_id,:module,:source,:detail,:status)""", {**item, "module_id": module_row["id"] if module_row else None})
+                    item = {"id": next_id(conn, "issues", "Q"), "status": "待处理", "detail": "", "assigned_to": "未分配", "created_by": "张工", **data}
+                    conn.execute("""INSERT INTO issues (id,title,module_id,module_name,source,detail,status,assigned_to,created_by)
+                        VALUES (:id,:title,:module_id,:module,:source,:detail,:status,:assigned_to,:created_by)""", {**item, "module_id": module_row["id"] if module_row else None})
                     return self.respond(HTTPStatus.CREATED, item)
+                if path.startswith("/api/issues/") and path.endswith("/comments"):
+                    issue_id = path.split("/")[3]
+                    if not str(data.get("body", "")).strip():
+                        return self.respond(HTTPStatus.BAD_REQUEST, {"error": "请填写讨论内容"})
+                    if not conn.execute("SELECT 1 FROM issues WHERE id=?", (issue_id,)).fetchone():
+                        return self.respond(HTTPStatus.NOT_FOUND, {"error": "未找到问题"})
+                    author = str(data.get("author_name") or "张工")
+                    result = conn.execute("INSERT INTO issue_comments (issue_id,author_name,body) VALUES (?,?,?)", (issue_id, author, data["body"].strip()))
+                    return self.respond(HTTPStatus.CREATED, {"id": result.lastrowid, "author_name": author, "body": data["body"].strip()})
                 if path == "/api/reuse-requests":
                     if any(not str(data.get(key, "")).strip() for key in ("module_id", "module_version", "project_name", "operating_conditions")):
                         return self.respond(HTTPStatus.BAD_REQUEST, {"error": "请填写复用申请信息"})
