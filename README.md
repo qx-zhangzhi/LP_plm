@@ -19,12 +19,15 @@
 - SQLite 持久化的模块、问题和复用申请
 - 模块发布冻结、发布清单与 GitLab 同步准备
 - 草稿编辑、验证记录与交付物发布门禁
+- 图纸与附件上传、模块内下载
 
 ## API（当前）
 
 - `GET/POST /api/modules`
 - `POST /api/modules/{id}/publish` — 生成发布清单、冻结版本并等待 GitLab Release 同步
 - `PATCH /api/modules/{id}` — 编辑草稿模块的验证、交付物与 GitLab 关联
+- `GET/POST /api/modules/{id}/files` — 获取或上传模块图纸、PDF、BOM 等附件
+- `GET /api/files/{id}/download` — 下载附件
 - `GET /api/modules/{id}/release`
 - `GET/POST /api/issues`
 - `PATCH /api/issues/{id}/close`
@@ -32,3 +35,5 @@
 - `GET /api/health`
 
 发布会要求模块先关联 GitLab 项目、填写验证记录，并登记 CAD 源文件、PDF、STEP、DXF、BOM 与装配说明。当前 MVP 已有后端 API，但尚未接入身份认证、GitLab / Git LFS、真实发布包和 SolidWorks 插件；这些是下一阶段的优先事项。
+
+上传文件保存在本机 `uploads/` 目录，单个文件上限为 100 MB；该目录与 SQLite 数据库都属于运行数据，应备份但不应提交到 Git。

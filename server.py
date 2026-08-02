@@ -7,14 +7,18 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import cgi
+import re
 from datetime import datetime, timezone
 from http import HTTPStatus
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urlparse, quote
 
 ROOT = Path(__file__).parent
 DB_PATH = ROOT / "modu.db"
+UPLOADS = ROOT / "uploads"
+MAX_UPLOAD_BYTES = 100 * 1024 * 1024
 
 SEED_MODULES = [
     {"id": "M-001", "name": "皮带直线运动模组", "version": "1.3", "status": "已发布", "icon": "↔", "purpose": "用于轻载 XY 直线运动。适合标准自动化工位。", "tags": "负载 ≤ 8 kg · 速度 ≤ 1 m/s · 室内低粉尘", "scope": "负载 ≤ 8 kg；速度 ≤ 1 m/s；室内低粉尘", "avoid": "高冲击、高粉尘，或定位精度优于 ±0.05 mm", "interface": "2020 铝型材安装面 · NEMA17 · 标准孔距", "deps": "2020 铝型材、GT2 皮带、HGR15 导轨", "verify": "刚度、装配验证已完成；寿命测试待补", "uses": 6},
@@ -47,6 +51,7 @@ def initialize():
             if column not in columns:
                 conn.execute(statement)
         conn.executescript((ROOT / "migrations" / "002_release_freeze.sql").read_text())
+        conn.executescript((ROOT / "migrations" / "004_module_files.sql").read_text())
         if conn.execute("SELECT COUNT(*) FROM modules").fetchone()[0] == 0:
             conn.executemany("""INSERT INTO modules
                 (id,name,version,status,icon,purpose,tags,scope,avoid,interface_spec,dependencies,verification,usage_count)
@@ -55,6 +60,7 @@ def initialize():
             module_ids = {row["name"]: row["id"] for row in conn.execute("SELECT id,name FROM modules")}
             conn.executemany("""INSERT INTO issues (id,title,module_id,module_name,source,detail,status)
                 VALUES (:id,:title,:module_id,:module,:source,:detail,:status)""", [{**issue, "module_id": module_ids.get(issue["module"])} for issue in SEED_ISSUES])
+    UPLOADS.mkdir(exist_ok=True)
 
 def module_view(row):
     result = dict(row)
@@ -106,6 +112,26 @@ class App(SimpleHTTPRequestHandler):
             with db() as conn:
                 requests = [dict(row) for row in conn.execute("SELECT * FROM reuse_requests ORDER BY created_at DESC")]
             return self.respond(HTTPStatus.OK, requests)
+        if path.startswith("/api/modules/") and path.endswith("/files"):
+            module_id = path.split("/")[3]
+            with db() as conn:
+                files = [dict(row) for row in conn.execute("SELECT id,filename,content_type,byte_size,uploaded_at FROM module_files WHERE module_id=? ORDER BY uploaded_at DESC", (module_id,))]
+            for item in files:
+                item["url"] = f"/api/files/{item['id']}/download"
+            return self.respond(HTTPStatus.OK, files)
+        if path.startswith("/api/files/") and path.endswith("/download"):
+            file_id = path.split("/")[3]
+            with db() as conn:
+                row = conn.execute("SELECT filename,stored_name,content_type FROM module_files WHERE id=?", (file_id,)).fetchone()
+            if not row or not (UPLOADS / row["stored_name"]).is_file():
+                return self.respond(HTTPStatus.NOT_FOUND, {"error": "未找到文件"})
+            payload = (UPLOADS / row["stored_name"]).read_bytes()
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", row["content_type"])
+            self.send_header("Content-Length", str(len(payload)))
+            self.send_header("Content-Disposition", f"attachment; filename*=UTF-8''{quote(row['filename'])}")
+            self.end_headers()
+            return self.wfile.write(payload)
         if path.startswith("/api/modules/") and path.endswith("/release"):
             module_id = path.split("/")[3]
             with db() as conn:
@@ -120,6 +146,8 @@ class App(SimpleHTTPRequestHandler):
     def do_POST(self):
         path = urlparse(self.path).path
         try:
+            if path.startswith("/api/modules/") and path.endswith("/files"):
+                return self.upload_file(path.split("/")[3])
             data = self.body()
             with db() as conn:
                 if path.startswith("/api/modules/") and path.endswith("/publish"):
@@ -183,6 +211,31 @@ class App(SimpleHTTPRequestHandler):
             self.respond(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
         except sqlite3.Error as exc:
             self.respond(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": f"数据库错误：{exc}"})
+
+    def upload_file(self, module_id):
+        if int(self.headers.get("Content-Length", "0")) > MAX_UPLOAD_BYTES:
+            return self.respond(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, {"error": "单个文件不能超过 100 MB"})
+        if "multipart/form-data" not in self.headers.get("Content-Type", ""):
+            return self.respond(HTTPStatus.BAD_REQUEST, {"error": "请使用 multipart/form-data 上传文件"})
+        form = cgi.FieldStorage(fp=self.rfile, headers=self.headers, environ={"REQUEST_METHOD": "POST", "CONTENT_TYPE": self.headers["Content-Type"]})
+        if "file" not in form or not getattr(form["file"], "file", None):
+            return self.respond(HTTPStatus.BAD_REQUEST, {"error": "请选择要上传的文件"})
+        upload = form["file"]
+        filename = Path(upload.filename or "").name
+        if not filename:
+            return self.respond(HTTPStatus.BAD_REQUEST, {"error": "文件名无效"})
+        raw = upload.file.read(MAX_UPLOAD_BYTES + 1)
+        if len(raw) > MAX_UPLOAD_BYTES:
+            return self.respond(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, {"error": "单个文件不能超过 100 MB"})
+        with db() as conn:
+            if not conn.execute("SELECT 1 FROM modules WHERE id=?", (module_id,)).fetchone():
+                return self.respond(HTTPStatus.NOT_FOUND, {"error": "未找到模块"})
+            stored_name = f"{module_id}_{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S%f')}_{re.sub(r'[^A-Za-z0-9._-]', '_', filename)}"
+            (UPLOADS / stored_name).write_bytes(raw)
+            result = conn.execute("""INSERT INTO module_files (module_id,filename,stored_name,content_type,byte_size)
+                VALUES (?,?,?,?,?)""", (module_id, filename, stored_name, upload.type or "application/octet-stream", len(raw)))
+            item = {"id": result.lastrowid, "filename": filename, "content_type": upload.type or "application/octet-stream", "byte_size": len(raw), "url": f"/api/files/{result.lastrowid}/download"}
+        return self.respond(HTTPStatus.CREATED, item)
 
     def do_PATCH(self):
         path = urlparse(self.path).path
