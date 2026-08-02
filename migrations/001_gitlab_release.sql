@@ -1,0 +1,4 @@
+ALTER TABLE modules ADD COLUMN gitlab_project TEXT NOT NULL DEFAULT '';
+ALTER TABLE modules ADD COLUMN gitlab_ref TEXT NOT NULL DEFAULT '';
+ALTER TABLE modules ADD COLUMN release_tag TEXT NOT NULL DEFAULT '';
+ALTER TABLE modules ADD COLUMN frozen_at TEXT;
